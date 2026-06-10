@@ -1,8 +1,8 @@
 """Entity reconciliation — LLM-driven consistency checking and repair.
 
 After dream processes bulletins, this module reviews entities against
-per-type rules, applies deterministic fixes, and raises questions for
-ambiguous conflicts.
+per-type rules. The LLM uses tools to look up related entities and
+apply fixes (add/retract/supersede claims, create/delete entities).
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from cyborg_server.services.memory.claim_types import (
     ENTITY_REF_CLAIM_KEYS,
     ENTITY_TYPE_PREFIXES,
     ENTITY_TYPE_REGISTRY,
+    ENTITY_TYPES,
     render_entity,
 )
 from cyborg_server.services.memory.claim_service import (
@@ -25,6 +26,8 @@ from cyborg_server.services.memory.claim_service import (
     _is_valid_file_path,
 )
 from cyborg_server.services.memory.models import Claim
+from cyborg_server.services.memory.merge import _execute_merge, _deduplicate_claims
+from cyborg_server.services.tools import Tool, tool
 
 logger = logging.getLogger(__name__)
 
@@ -37,12 +40,317 @@ _ENTITY_TYPE_PREFIXES = ENTITY_TYPE_PREFIXES
 _SKIP_EXPAND_PREFIXES = tuple(et.prefix for et in ENTITY_TYPE_REGISTRY.values() if et.skip_expand)
 
 # ---------------------------------------------------------------------------
+# Reconciliation tools — read and write access for the LLM
+# ---------------------------------------------------------------------------
+
+
+def make_reconciliation_tools(db: Any, *, on_entity_merged: Any = None) -> list[Tool]:
+    """Create reconciliation tools bound to the given database connection.
+
+    on_entity_merged: async callback(canonical_id) called after a merge,
+                      used to queue reconciliation on the resulting entity.
+    """
+
+    @tool
+    async def list_entities(entity_type: str) -> str:
+        """List active entities of a given type. Returns entity IDs and display names.
+
+        Use this to discover related entities (e.g. find all trips, all connections).
+        """
+        if entity_type not in ENTITY_TYPES:
+            return f"Unknown entity type: {entity_type}. Valid types: {', '.join(ENTITY_TYPES)}"
+        rows = await db.fetch_all(
+            "SELECT entity_id, display_name FROM memory_entities "
+            "WHERE entity_type = ? AND status = 'active'",
+            (entity_type,),
+        )
+        if not rows:
+            return f"No active {entity_type} entities found."
+        lines = [f"{r['entity_id']} ({r['display_name'] or r['entity_id']})" for r in rows]
+        return "\n".join(lines)
+
+    @tool
+    async def get_entity(entity_id: str) -> str:
+        """Get full rendered details of an entity including all its claims.
+
+        Returns the entity's type, display name, all claim values, and provenance.
+        """
+        row = await db.fetch_one(
+            "SELECT entity_id, entity_type, display_name FROM memory_entities "
+            "WHERE entity_id = ? AND status = 'active'",
+            (entity_id,),
+        )
+        if not row:
+            return f"Entity not found: {entity_id}"
+
+        claims = await db.fetch_all(
+            "SELECT claim_type_key, object_id, value, source_bulletins FROM memory_claims "
+            "WHERE status = 'active' AND subject_id = ?",
+            (entity_id,),
+        )
+        claim_dicts = [
+            {"claim_type_key": r["claim_type_key"], "object_id": r["object_id"], "value": r["value"]}
+            for r in claims
+        ]
+
+        rendered = await render_entity(
+            row["entity_type"], row["display_name"], claim_dicts,
+            entity_id=entity_id, db=db,
+        )
+
+        # Append provenance
+        prov_lines: list[str] = []
+        for r in claims:
+            val = r["value"] or r["object_id"] or ""
+            src = r["source_bulletins"] or ""
+            src_label = ""
+            if src:
+                try:
+                    bids = json.loads(src) if isinstance(src, str) else src
+                    if bids:
+                        src_label = f"  [source: {', '.join(bids)}]"
+                    else:
+                        src_label = "  [source: none — inferred]"
+                except (json.JSONDecodeError, TypeError):
+                    src_label = f"  [source: {src}]"
+            elif r["claim_type_key"] not in ("truth",):
+                src_label = "  [source: none — inferred]"
+            prov_lines.append(f"  {r['claim_type_key']}: {val}{src_label}")
+        if prov_lines:
+            rendered += "\n\nProvenance:\n" + "\n".join(prov_lines)
+
+        # Also show reverse references (entities that reference this one)
+        reverse = await db.fetch_all(
+            "SELECT c.claim_type_key, c.subject_id, e.display_name "
+            "FROM memory_claims c "
+            "LEFT JOIN memory_entities e ON e.entity_id = c.subject_id "
+            "WHERE c.status = 'active' AND c.object_id = ?",
+            (entity_id,),
+        )
+        if reverse:
+            rendered += "\n\nReferenced by:"
+            for rc in reverse:
+                label = rc["display_name"] or rc["subject_id"]
+                rendered += f"\n  - {label} [{rc['claim_type_key']}]"
+
+        return rendered
+
+    @tool
+    async def add_claim(
+        subject_id: str,
+        claim_type_key: str,
+        value: str = "",
+        object_id: str = "",
+    ) -> str:
+        """Add a claim to an entity. Use value for scalar data (dates, text) and object_id for entity references.
+
+        For entity-ref claims (connection, leg, member, etc.), use object_id not value.
+        Only one of value/object_id should be set.
+        """
+        if not subject_id or not claim_type_key:
+            return "Error: subject_id and claim_type_key are required."
+        # Entity-ref claims should use object_id; ensure only one of value/object_id is set
+        val = value if value else None
+        obj = object_id if object_id else None
+        if claim_type_key in ENTITY_REF_CLAIM_KEYS and val and not obj:
+            obj, val = val, None
+        # If both set, prefer object_id for entity-ref claims, value otherwise
+        if val and obj:
+            if claim_type_key in ENTITY_REF_CLAIM_KEYS:
+                val = None
+            else:
+                obj = None
+        claim = Claim(
+            id=f"claim-recon-{uuid.uuid4().hex[:8]}",
+            claim_type_key=claim_type_key,
+            subject_id=subject_id,
+            value=val,
+            object_id=obj,
+            status="active",
+            source_bulletins=[],
+            created_at=datetime.now(),
+        )
+        await write_claim(db, claim)
+        return f"Added {claim_type_key} claim on {subject_id}" + (f" → {obj}" if obj else f" = {val}")
+
+    @tool
+    async def retract_claim(
+        subject_id: str,
+        claim_type_key: str,
+        old_value: str = "",
+    ) -> str:
+        """Retract (supersede) an active claim on an entity.
+
+        If old_value is provided, only retracts claims matching that value.
+        If omitted, retracts all active claims of that type on the entity.
+        """
+        if not subject_id or not claim_type_key:
+            return "Error: subject_id and claim_type_key are required."
+        rows = await db.fetch_all(
+            "SELECT id, value, object_id FROM memory_claims "
+            "WHERE status = 'active' AND subject_id = ? AND claim_type_key = ?",
+            (subject_id, claim_type_key),
+        )
+        retracted = 0
+        for row in rows:
+            val = row["value"] or row["object_id"] or ""
+            if old_value and val != old_value:
+                continue
+            await db.execute(
+                "UPDATE memory_claims SET status = 'superseded', superseded_by = ? WHERE id = ?",
+                (json.dumps(["reconciliation"]), row["id"]),
+            )
+            retracted += 1
+            if not old_value:
+                break
+        return f"Retracted {retracted} {claim_type_key} claim(s) on {subject_id}"
+
+    @tool
+    async def supersede_claim_tool(
+        subject_id: str,
+        claim_type_key: str,
+        old_value: str,
+        new_value: str = "",
+        new_object_id: str = "",
+    ) -> str:
+        """Replace a claim value. The old claim is superseded and a new one created.
+
+        Provide either new_value (for scalars) or new_object_id (for entity refs).
+        """
+        if not subject_id or not claim_type_key or not old_value:
+            return "Error: subject_id, claim_type_key, and old_value are required."
+        rows = await db.fetch_all(
+            "SELECT id, value, object_id FROM memory_claims "
+            "WHERE status = 'active' AND subject_id = ? AND claim_type_key = ?",
+            (subject_id, claim_type_key),
+        )
+        for row in rows:
+            val = row["value"] or row["object_id"] or ""
+            if old_value and val != old_value:
+                continue
+            nv = new_value if new_value else None
+            no = new_object_id if new_object_id else None
+            if claim_type_key in ENTITY_REF_CLAIM_KEYS and nv and not no:
+                no, nv = nv, None
+            new_claim = Claim(
+                id=f"claim-recon-{uuid.uuid4().hex[:8]}",
+                claim_type_key=claim_type_key,
+                subject_id=subject_id,
+                value=nv,
+                object_id=no,
+                status="active",
+                source_bulletins=[],
+                created_at=datetime.now(),
+            )
+            await supersede_claim(db, row["id"], new_claim, "reconciliation")
+            return f"Superseded {claim_type_key} on {subject_id}: {old_value} → {nv or no}"
+        return f"No matching claim found: {claim_type_key}={old_value} on {subject_id}"
+
+    @tool
+    async def create_entity(
+        entity_id: str,
+        entity_type: str,
+        claims_json: str = "[]",
+    ) -> str:
+        """Create a new entity with optional initial claims.
+
+        claims_json should be a JSON array of objects with claim_type_key, value, and/or object_id.
+        """
+        if not entity_id or not entity_type:
+            return "Error: entity_id and entity_type are required."
+        display_name = entity_id.split("-", 1)[-1].replace("-", " ").title() if "-" in entity_id else entity_id
+        await db.execute(
+            "INSERT OR IGNORE INTO memory_entities (entity_id, entity_type, display_name, status) "
+            "VALUES (?, ?, ?, 'active')",
+            (entity_id, entity_type, display_name),
+        )
+        try:
+            new_claims = json.loads(claims_json) if claims_json else []
+        except json.JSONDecodeError:
+            return f"Created entity {entity_id} but claims_json was invalid."
+        for cl in new_claims:
+            claim = Claim(
+                id=f"claim-recon-{uuid.uuid4().hex[:8]}",
+                claim_type_key=cl.get("claim_type_key", ""),
+                subject_id=entity_id,
+                value=cl.get("value"),
+                object_id=cl.get("object_id"),
+                status="active",
+                source_bulletins=[],
+                created_at=datetime.now(),
+            )
+            await write_claim(db, claim)
+        return f"Created entity {entity_id} ({entity_type}) with {len(new_claims)} claims"
+
+    @tool
+    async def delete_entity(entity_id: str) -> str:
+        """Archive an entity and supersede all its active claims."""
+        if not entity_id:
+            return "Error: entity_id is required."
+        await db.execute(
+            "UPDATE memory_entities SET status = 'archived' WHERE entity_id = ?",
+            (entity_id,),
+        )
+        await db.execute(
+            "UPDATE memory_claims SET status = 'superseded' "
+            "WHERE subject_id = ? AND status = 'active'",
+            (entity_id,),
+        )
+        return f"Archived entity {entity_id}"
+
+    @tool
+    async def merge_entities(canonical_id: str, loser_id: str) -> str:
+        """Merge two duplicate entities. loser_id is absorbed into canonical_id.
+
+        All claims, references, and bulletins from loser are rewritten to point
+        to canonical. The loser entity is deleted. Use when two entities represent
+        the same real-world thing (e.g. duplicate connections with slightly different names).
+        """
+        if not canonical_id or not loser_id:
+            return "Error: canonical_id and loser_id are required."
+        if canonical_id == loser_id:
+            return "Error: canonical_id and loser_id must be different."
+        # Verify both entities exist
+        for eid, label in [(canonical_id, "canonical"), (loser_id, "loser")]:
+            row = await db.fetch_one(
+                "SELECT entity_id FROM memory_entities WHERE entity_id = ? AND status = 'active'",
+                (eid,),
+            )
+            if not row:
+                return f"Error: {label} entity {eid} not found or not active."
+        result = await _execute_merge(db, canonical_id, loser_id)
+        deduped = await _deduplicate_claims(db, canonical_id)
+        # Queue reconciliation on the merged entity
+        if on_entity_merged:
+            await on_entity_merged(canonical_id)
+        return (
+            f"Merged {loser_id} into {canonical_id}. "
+            f"{result['claims_rewritten']} claims rewritten, "
+            f"{deduped} duplicates removed."
+        )
+
+    return [
+        list_entities,
+        get_entity,
+        add_claim,
+        retract_claim,
+        supersede_claim_tool,
+        create_entity,
+        delete_entity,
+        merge_entities,
+    ]
+
+
+# ---------------------------------------------------------------------------
 # LLM prompt
 # ---------------------------------------------------------------------------
 
 RECONCILIATION_PROMPT = """\
 You are a Memory Reconciliation Agent. You review an entity and its related \
 sub-entities, checking for inconsistencies against a set of rules.
+
+You have tools to look up other entities and apply fixes. Use them freely — \
+prefer acting over asking.
 
 ## Entity Under Review
 
@@ -65,62 +373,23 @@ sub-entities, checking for inconsistencies against a set of rules.
 1. Check the entity data against each rule above.
 2. Use the Source Bulletins and claim provenance to resolve conflicts — claims with \
 no source bulletin are inferred and less reliable than claims grounded in bulletins.
-3. If you can determine a clear fix, propose a claim operation — prefer acting over asking.
+3. If you can determine a clear fix, use the tools to apply it — prefer acting over asking.
 4. Answered questions are ground truth from the user — act on them directly, do not re-ask.
 5. If a child entity has been split or merged, update the parent's composition claims (e.g. trip.leg) accordingly.
-6. When splitting a stay into multiple new stays, you MUST include a delete_entity operation \
-for the original stay AFTER creating its replacements. The original stay is no longer valid once \
-its data has been distributed to the new entities. Also retract the parent's leg claim pointing to it.
+6. When splitting a stay into multiple new stays, create the new entities first, then \
+retract the parent's leg claim pointing to the original and delete the original entity.
 7. If the fix is truly ambiguous with no answered question guiding it, raise a question instead.
-8. If the entity is consistent, return empty arrays.
+8. Use list_entities and get_entity to discover and inspect related entities when needed.
+9. If the entity is consistent and no fixes are needed, respond with an empty issues list.
 
 ## Output Format
 
-Return a JSON object:
+When you are done applying fixes (or if no fixes were needed), respond with a JSON object:
 
 ```json
 {{
   "issues": [
-    {{"rule": "which rule is violated", "detail": "what specifically is wrong"}}
-  ],
-  "operations": [
-    {{
-      "action": "supersede",
-      "subject_id": "entity-id",
-      "claim_type_key": "claim_key",
-      "old_value": "current value",
-      "new_value": "corrected value",
-      "reason": "why"
-    }},
-    {{
-      "action": "add",
-      "claim_type_key": "claim_key",
-      "subject_id": "entity-id",
-      "value": "the value",
-      "reason": "why"
-    }},
-    {{
-      "action": "retract",
-      "subject_id": "entity-id",
-      "claim_type_key": "claim_key",
-      "old_value": "value to remove",
-      "reason": "why"
-    }},
-    {{
-      "action": "create_entity",
-      "entity_id": "new-entity-id",
-      "entity_type": "stay",
-      "claims": [
-        {{"claim_type_key": "accommodation", "value": "location-id"}},
-        {{"claim_type_key": "arrival_date", "value": "2026-07-01T15:00"}}
-      ],
-      "reason": "why"
-    }},
-    {{
-      "action": "delete_entity",
-      "entity_id": "entity-id-to-archive",
-      "reason": "why"
-    }}
+    {{"rule": "which rule was violated", "detail": "what was wrong and what you did"}}
   ],
   "questions": [
     {{
@@ -133,8 +402,8 @@ Return a JSON object:
 }}
 ```
 
-Return ONLY the JSON object. No other text.
-If no issues found: {{"issues": [], "operations": [], "questions": []}}
+Apply all fixes using tools FIRST, then return the JSON summary.
+If no issues found: {{"issues": [], "questions": []}}
 """
 
 
@@ -173,11 +442,12 @@ async def render_entity_full(
         for r in claims
     ]
 
-    rendered = render_entity(
+    rendered = await render_entity(
         entity_row["entity_type"],
         entity_row["display_name"],
         claim_dicts,
         entity_id=entity_id,
+        db=db,
     )
 
     # Append provenance tags (source bulletins) to each claim line
@@ -226,7 +496,7 @@ async def render_entity_full(
 
 
 # ---------------------------------------------------------------------------
-# reconcile_entity — LLM-driven detect + fix + question
+# reconcile_entity — LLM-driven detect + fix + question (tool-based)
 # ---------------------------------------------------------------------------
 
 async def _load_answers(db: Any, entity_id: str) -> str:
@@ -266,145 +536,6 @@ async def _write_questions(
         ids.append(qid)
         logger.info("Reconciliation question raised: %s", qid)
     return ids
-
-
-async def _apply_operations(
-    db: Any, entity_id: str, operations: list[dict],
-) -> list[dict]:
-    """Apply reconciliation operations (supersede/add/delete_entity)."""
-    applied = []
-
-    for op in operations:
-        action = op.get("action")
-
-        if action == "supersede":
-            subject = op.get("subject_id", "")
-            ctk = op.get("claim_type_key", "")
-            old_val = op.get("old_value", "")
-            new_val = op.get("new_value", "")
-
-            if not subject or not ctk or not new_val:
-                logger.warning("Skipping incomplete supersede op: %s", op)
-                continue
-
-            # Find the matching active claim
-            rows = await db.fetch_all(
-                "SELECT id, value, object_id FROM memory_claims "
-                "WHERE status = 'active' AND subject_id = ? AND claim_type_key = ?",
-                (subject, ctk),
-            )
-            for row in rows:
-                val = row["value"] or row["object_id"] or ""
-                if old_val and val != old_val:
-                    continue
-                recon_ref = f"recon-{entity_id}"
-                new_claim = Claim(
-                    id=f"claim-recon-{uuid.uuid4().hex[:8]}",
-                    claim_type_key=ctk,
-                    subject_id=subject,
-                    value=new_val,
-                    status="active",
-                    source_bulletins=[],
-                    created_at=datetime.now(),
-                )
-                await supersede_claim(db, row["id"], new_claim, recon_ref)
-                applied.append(op)
-                break
-
-        elif action == "add":
-            subject = op.get("subject_id", "")
-            ctk = op.get("claim_type_key", "")
-            val = op.get("value")
-            obj = op.get("object_id")
-            if not subject or not ctk:
-                logger.warning("Skipping incomplete add op: %s", op)
-                continue
-            # Entity-ref claims should use object_id, not value
-            if ctk in ENTITY_REF_CLAIM_KEYS and val and not obj:
-                obj, val = val, None
-            claim = Claim(
-                id=f"claim-recon-{uuid.uuid4().hex[:8]}",
-                claim_type_key=ctk,
-                subject_id=subject,
-                value=val,
-                object_id=obj,
-                status="active",
-                source_bulletins=[],
-                created_at=datetime.now(),
-            )
-            await write_claim(db, claim)
-            applied.append(op)
-
-        elif action == "retract":
-            subject = op.get("subject_id", "")
-            ctk = op.get("claim_type_key", "")
-            old_val = op.get("old_value", "")
-            if not subject or not ctk:
-                logger.warning("Skipping incomplete retract op: %s", op)
-                continue
-            rows = await db.fetch_all(
-                "SELECT id, value, object_id FROM memory_claims "
-                "WHERE status = 'active' AND subject_id = ? AND claim_type_key = ?",
-                (subject, ctk),
-            )
-            recon_ref = f"recon-{entity_id}"
-            for row in rows:
-                val = row["value"] or row["object_id"] or ""
-                if old_val and val != old_val:
-                    continue
-                await db.execute(
-                    "UPDATE memory_claims SET status = 'superseded', superseded_by = ? WHERE id = ?",
-                    (json.dumps([recon_ref]), row["id"]),
-                )
-                applied.append(op)
-                if not old_val:
-                    break  # If no old_value specified, only retract first match
-
-        elif action == "create_entity":
-            target_id = op.get("entity_id", "")
-            target_type = op.get("entity_type", "")
-            new_claims = op.get("claims", [])
-            if not target_id or not target_type:
-                logger.warning("Skipping incomplete create_entity op: %s", op)
-                continue
-            # Create entity record
-            display_name = target_id.split("-", 1)[-1].replace("-", " ").title() if "-" in target_id else target_id
-            await db.execute(
-                "INSERT OR IGNORE INTO memory_entities (entity_id, entity_type, display_name, status) "
-                "VALUES (?, ?, ?, 'active')",
-                (target_id, target_type, display_name),
-            )
-            # Write initial claims
-            for cl in new_claims:
-                claim = Claim(
-                    id=f"claim-recon-{uuid.uuid4().hex[:8]}",
-                    claim_type_key=cl.get("claim_type_key", ""),
-                    subject_id=target_id,
-                    value=cl.get("value"),
-                    object_id=cl.get("object_id"),
-                    status="active",
-                    source_bulletins=[],
-                    created_at=datetime.now(),
-                )
-                await write_claim(db, claim)
-            applied.append(op)
-
-        elif action == "delete_entity":
-            target_id = op.get("entity_id", "")
-            if not target_id:
-                continue
-            await db.execute(
-                "UPDATE memory_entities SET status = 'archived' WHERE entity_id = ?",
-                (target_id,),
-            )
-            await db.execute(
-                "UPDATE memory_claims SET status = 'superseded' "
-                "WHERE subject_id = ? AND status = 'active'",
-                (target_id,),
-            )
-            applied.append(op)
-
-    return applied
 
 
 async def _collect_bulletin_text(db: Any, entity_id: str) -> str:
@@ -502,10 +633,15 @@ async def reconcile_entity(
     entity_id: str,
     *,
     update_fts_fn=None,
+    schedule_reconciliation_fn=None,
 ) -> dict[str, Any]:
-    """Run reconciliation for a single entity.
+    """Run reconciliation for a single entity using tool-based LLM interaction.
 
-    Returns {"issues": [...], "operations_applied": [...], "questions_raised": [...]}.
+    The LLM has access to tools for looking up related entities and applying
+    fixes directly. Returns {"issues": [...], "operations_applied": [...], "questions_raised": [...]}.
+
+    schedule_reconciliation_fn: async callback(entity_ids) to queue post-merge
+                                 reconciliation on the resulting entities.
     """
     entity_row = await db.fetch_one(
         "SELECT entity_type FROM memory_entities WHERE entity_id = ? AND status = 'active'",
@@ -533,54 +669,80 @@ async def reconcile_entity(
         rules=rules,
     )
 
-    response = await llm.chat(
+    # Build tools for the reconciliation LLM
+    async def _on_entity_merged(canonical_id: str) -> None:
+        """Queue reconciliation on the merged entity."""
+        if schedule_reconciliation_fn:
+            await schedule_reconciliation_fn([canonical_id])
+
+    recon_tools = make_reconciliation_tools(db, on_entity_merged=_on_entity_merged)
+
+    # Track entities touched by tool calls for FTS updates
+    touched_entities: set[str] = {entity_id}
+
+    # Wrap tool handlers to track touched entities
+    original_handlers = {t.name: t.handler for t in recon_tools}
+
+    def _track(entity_ids: set[str]):
+        """Return a decorator that tracks entity IDs touched by tool calls."""
+        def _wrap_handler(handler):
+            async def _tracked(*args, **kwargs):
+                result = await handler(*args, **kwargs)
+                # Track subject_id if passed
+                sid = kwargs.get("subject_id", "")
+                if sid:
+                    entity_ids.add(sid)
+                eid = kwargs.get("entity_id", "")
+                if eid:
+                    entity_ids.add(eid)
+                return result
+            return _tracked
+        return _wrap_handler
+
+    for t in recon_tools:
+        t.handler = _track(touched_entities)(original_handlers[t.name])
+
+    response = await llm.chat_with_tools(
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": "Review this entity for consistency issues."},
         ],
-        model=llm.memory_model,
+        tools=recon_tools,
         call_category="memory_reconciliation",
-        temperature=0.1,
-        max_tokens=1500,
     )
 
+    # Parse the final JSON response for issues and questions
+    issues: list[dict] = []
+    questions: list[dict] = []
     try:
         text = response.strip()
         if text.startswith("```"):
             text = text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
         result = json.loads(text)
+        issues = result.get("issues", [])
+        questions = result.get("questions", [])
     except (json.JSONDecodeError, ValueError):
-        logger.warning("Reconciliation: failed to parse LLM response for %s", entity_id)
-        return {"issues": [], "operations_applied": [], "questions_raised": []}
+        # Tools already applied their effects — just log the parse failure
+        logger.warning("Reconciliation: failed to parse final response for %s", entity_id)
 
-    issues = result.get("issues", [])
-    operations = result.get("operations", [])
-    questions = result.get("questions", [])
-
-    applied = await _apply_operations(db, entity_id, operations)
     question_ids = await _write_questions(db, entity_id, questions)
 
     # Re-render FTS for all affected entities
-    if update_fts_fn and (applied or question_ids):
-        touched = {entity_id}
-        for op in applied:
-            touched.add(op.get("subject_id", ""))
-            if op.get("entity_id"):
-                touched.add(op["entity_id"])
-        for eid in touched:
+    if update_fts_fn:
+        for eid in touched_entities:
             try:
                 await update_fts_fn(eid)
             except Exception:
                 pass
 
-    if issues:
+    if issues or question_ids:
         logger.info(
-            "Reconciliation for %s: %d issues, %d ops applied, %d questions",
-            entity_id, len(issues), len(applied), len(question_ids),
+            "Reconciliation for %s: %d issues, %d questions",
+            entity_id, len(issues), len(question_ids),
         )
 
     return {
         "issues": issues,
-        "operations_applied": applied,
+        "operations_applied": [],  # Operations were applied via tools, not batched
         "questions_raised": question_ids,
     }

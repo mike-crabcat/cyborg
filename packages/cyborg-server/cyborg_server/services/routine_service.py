@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 from cyborg_server.services.base import BaseService
@@ -36,7 +36,7 @@ class RoutineService(BaseService):
         next_run_at: str | None = None,
     ) -> dict[str, Any]:
         existing = await self.get_routine(session_key, name)
-        now = datetime.now(UTC).isoformat()
+        now = datetime.now().astimezone().isoformat()
 
         if existing:
             await self.db.execute(
@@ -63,7 +63,7 @@ class RoutineService(BaseService):
         return count > 0
 
     async def get_due_routines(self) -> list[dict[str, Any]]:
-        now = datetime.now(UTC).isoformat()
+        now = datetime.now().astimezone().isoformat()
         rows = await self.db.fetch_all(
             "SELECT id, session_key, name, schedule, prompt, enabled, next_run_at, last_run_at "
             "FROM routines WHERE enabled = 1 AND next_run_at <= ?",
@@ -72,7 +72,7 @@ class RoutineService(BaseService):
         return [dict(r) for r in rows] if rows else []
 
     async def mark_run(self, routine_id: str, next_run_at: str) -> None:
-        now = datetime.now(UTC).isoformat()
+        now = datetime.now().astimezone().isoformat()
         await self.db.execute(
             "UPDATE routines SET last_run_at = ?, next_run_at = ?, updated_at = ? WHERE id = ?",
             (now, next_run_at, now, routine_id),

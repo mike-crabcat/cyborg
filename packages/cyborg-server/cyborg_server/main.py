@@ -96,6 +96,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 wa_bridge_service = WhatsAppBridgeService(app_ctx)
                 await wa_bridge_service.start()
                 app.state.whatsapp_bridge_service = wa_bridge_service
+                app_ctx.whatsapp_bridge = wa_bridge_service
                 logger.info("WhatsApp bridge service started")
             except Exception:
                 logger.exception("WhatsApp bridge service failed to start")

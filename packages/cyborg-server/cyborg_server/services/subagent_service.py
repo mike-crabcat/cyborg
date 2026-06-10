@@ -25,6 +25,14 @@ Your working directory is the workspace — write files here by default (no abso
 Provide clear, concise output describing what you did and what the result is.
 """
 
+LOCAL_SUBAGENT_SYSTEM_PROMPT = """\
+You are a subagent of Cyborg. You have been assigned a task.
+Use your available tools to accomplish it.
+Your working directory is the workspace root.
+Provide clear, concise output describing what you did and what the result is.
+When done, output your final answer as plain text.
+"""
+
 
 def _get_lock(subagent_id: str) -> asyncio.Lock:
     if subagent_id not in _locks:
@@ -35,7 +43,9 @@ def _get_lock(subagent_id: str) -> asyncio.Lock:
 class SubagentService(BaseService):
     """Manages async subagent lifecycle — create, run, message, check, list, kill."""
 
-    async def create_subagent(self, task: str, parent_session_key: str) -> dict[str, Any]:
+    async def create_subagent(
+        self, task: str, parent_session_key: str, *, agent_type: str = "claude", persona: bool = False, model: str = "",
+    ) -> dict[str, Any]:
         subagent_id = str(uuid4())
         short_id = subagent_id[:8]
         session_key = f"subagent:{parent_session_key}:{short_id}"
@@ -43,9 +53,9 @@ class SubagentService(BaseService):
 
         await self.db.execute(
             """INSERT INTO subagents
-               (id, parent_session_key, session_key, task, status, created_at, updated_at)
-               VALUES (?, ?, ?, ?, 'created', ?, ?)""",
-            (subagent_id, parent_session_key, session_key, task, now, now),
+               (id, parent_session_key, session_key, task, status, agent_type, persona, model, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 'created', ?, ?, ?, ?, ?)""",
+            (subagent_id, parent_session_key, session_key, task, agent_type, int(persona), model, now, now),
         )
 
         t = asyncio.create_task(self._run_subagent(subagent_id, task))
@@ -63,16 +73,37 @@ class SubagentService(BaseService):
         short_id = subagent_id[:8]
         await self._update_status(subagent_id, "running")
 
+        row = await self.db.fetch_one(
+            "SELECT agent_type, persona, session_key, model FROM subagents WHERE id = ?",
+            (subagent_id,),
+        )
+        agent_type = row["agent_type"] if row else "claude"
+        session_key = row["session_key"] if row else ""
+        persona = bool(row["persona"]) if row else False
+        model = row["model"] if row else ""
+
         settings = self._get_settings()
-        workspace_dir = settings.harness.workspace_dir.expanduser().resolve()
 
         try:
-            result = await self._run_claude(
-                prompt=task,
-                cwd=workspace_dir,
-                model=settings.harness.skill_dev_model,
-                max_budget=settings.harness.skill_dev_max_budget_usd,
-            )
+            if agent_type == "local":
+                # Store user message in session before execution
+                from cyborg_server.services.session_service import SessionService
+                await SessionService(self.ctx).add_message(
+                    session_key, "user", task, channel="subagent",
+                )
+                result = await self._run_local(
+                    session_key=session_key,
+                    persona=persona,
+                    model=model,
+                )
+            else:
+                workspace_dir = settings.harness.workspace_dir.expanduser().resolve()
+                result = await self._run_claude(
+                    prompt=task,
+                    cwd=workspace_dir,
+                    model=settings.harness.skill_dev_model,
+                    max_budget=settings.harness.skill_dev_max_budget_usd,
+                )
         except Exception as e:
             logger.error("Subagent %s failed: %s", short_id, e)
             await self._update_status(subagent_id, "failed", error=str(e))
@@ -93,13 +124,13 @@ class SubagentService(BaseService):
             (result_text, claude_session_id, cost, now, subagent_id),
         )
 
-        # Store messages in subagent's own session
+        # Store assistant message in subagent session
+        # (user message already stored before execution for local, or stored here for claude)
         from cyborg_server.services.session_service import SessionService
         session_svc = SessionService(self.ctx)
-        row = await self.db.fetch_one("SELECT session_key FROM subagents WHERE id = ?", (subagent_id,))
-        if row:
-            await session_svc.add_message(row["session_key"], "user", task, channel="subagent")
-            await session_svc.add_message(row["session_key"], "assistant", result_text, channel="subagent")
+        if agent_type != "local":
+            await session_svc.add_message(session_key, "user", task, channel="subagent")
+        await session_svc.add_message(session_key, "assistant", result_text, channel="subagent")
 
         await self._publish_event(subagent_id, "result_ready")
         await self._notify_parent(subagent_id, result_text)
@@ -119,20 +150,38 @@ class SubagentService(BaseService):
         if row["status"] not in ("waiting_for_parent", "running"):
             return {"ok": False, "error": f"Subagent is in status '{row['status']}', cannot receive messages"}
 
+        agent_type = row["agent_type"]
+        persona = bool(row["persona"])
+        session_key = row["session_key"]
+        model = row["model"]
+
         async with _get_lock(subagent_id):
             await self._update_status(subagent_id, "running")
 
             settings = self._get_settings()
-            workspace_dir = settings.harness.workspace_dir.expanduser().resolve()
+
+            # Store user message before execution (local needs it in session history)
+            from cyborg_server.services.session_service import SessionService
+            session_svc = SessionService(self.ctx)
+            if agent_type == "local":
+                await session_svc.add_message(session_key, "user", message, channel="subagent")
 
             try:
-                result = await self._run_claude(
-                    prompt=message,
-                    cwd=workspace_dir,
-                    session_id=row["claude_session_id"],
-                    model=settings.harness.skill_dev_model,
-                    max_budget=settings.harness.skill_dev_max_budget_usd,
-                )
+                if agent_type == "local":
+                    result = await self._run_local(
+                        session_key=session_key,
+                        persona=persona,
+                        model=model,
+                    )
+                else:
+                    workspace_dir = settings.harness.workspace_dir.expanduser().resolve()
+                    result = await self._run_claude(
+                        prompt=message,
+                        cwd=workspace_dir,
+                        session_id=row["claude_session_id"],
+                        model=settings.harness.skill_dev_model,
+                        max_budget=settings.harness.skill_dev_max_budget_usd,
+                    )
             except Exception as e:
                 await self._update_status(subagent_id, "failed", error=str(e))
                 return {"ok": False, "error": str(e), "subagent_id": subagent_id}
@@ -152,10 +201,9 @@ class SubagentService(BaseService):
             )
 
             # Store messages in subagent session
-            from cyborg_server.services.session_service import SessionService
-            session_svc = SessionService(self.ctx)
-            await session_svc.add_message(row["session_key"], "user", message, channel="subagent")
-            await session_svc.add_message(row["session_key"], "assistant", result_text, channel="subagent")
+            if agent_type != "local":
+                await session_svc.add_message(session_key, "user", message, channel="subagent")
+            await session_svc.add_message(session_key, "assistant", result_text, channel="subagent")
 
             await self._publish_event(subagent_id, "result_ready")
             await self._notify_parent(subagent_id, result_text)
@@ -291,6 +339,61 @@ class SubagentService(BaseService):
                 "subagent_id": subagent_id,
                 "status": status,
             })
+
+    async def _run_local(
+        self,
+        *,
+        session_key: str,
+        persona: bool = False,
+        model: str = "",
+    ) -> dict[str, Any]:
+        """Run a subagent in-process using the existing chat_with_tools loop."""
+        settings = self._get_settings()
+        resolved_model = model or settings.harness.local_subagent_model
+
+        # Build system prompt
+        if persona:
+            from cyborg_server.services.prompt_assembler import load_workspace_prompt
+            system_content = await load_workspace_prompt(
+                settings.harness.workspace_dir, db=self.db,
+            )
+        else:
+            workspace_dir = settings.harness.workspace_dir.expanduser().resolve()
+            system_content = (
+                LOCAL_SUBAGENT_SYSTEM_PROMPT
+                + f"\nYour workspace root is: {workspace_dir}"
+            )
+
+        # Build workspace-only tool set
+        from cyborg_server.services.workspace_tools import make_workspace_tools
+        tools = make_workspace_tools(self.ctx, session_key=session_key)
+
+        # Build messages from session history
+        from cyborg_server.services.prompt_assembler import build_chat_messages
+        messages = await build_chat_messages(
+            None, session_key,
+            db=self.db,
+            system_content=system_content,
+            max_history=50,
+        )
+
+        # Dispatch via LLM dispatch (logs calls, publishes events)
+        from cyborg_server.services.llm_dispatch import LLMDispatchService
+        result_text = await LLMDispatchService(self.ctx).chat_with_tools(
+            messages=messages,
+            tools=tools,
+            model=resolved_model,
+            max_iterations=30,
+            call_category="local_subagent",
+            session_key=session_key,
+        )
+
+        logger.info(
+            "Local subagent: model=%s chars=%d",
+            resolved_model, len(result_text),
+        )
+
+        return {"result": result_text, "session_id": "", "cost_usd": 0}
 
     async def _run_claude(
         self,

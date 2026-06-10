@@ -138,6 +138,7 @@ async def _prepare_media(path: str) -> str | None:
             return path
 
     import functools
+    import tempfile
 
     def _resize() -> str | None:
         from io import BytesIO
@@ -1360,7 +1361,7 @@ class WhatsAppBridgeService(BaseService):
         if contact_id and chat_kind != "group":
             from cyborg_server.services.memory import MemoryService
             mem_svc = MemoryService(self.ctx)
-            entry = mem_svc.find_person_entry(
+            entry = await mem_svc.find_person_entry(
                 settings.harness.workspace_dir, contact_id=contact_id,
             )
             if entry:

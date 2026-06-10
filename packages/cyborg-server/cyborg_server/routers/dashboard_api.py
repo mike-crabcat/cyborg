@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico"}
+_STREAMABLE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico", ".pdf"}
 
 
 def _resolve_workspace_path(settings: Any, path: str) -> Path:
@@ -211,6 +211,7 @@ async def get_home(request: Request) -> dict[str, Any]:
         # Pricing per 1M tokens (input, output)
         _PRICING: dict[str, tuple[float, float]] = {
             "gpt-5.4-mini": (1.50, 6.00),
+            "gpt-5.5": (6.00, 24.00),
         }
         category_totals: dict[str, dict[str, Any]] = {}
         for row in cost_rows:
@@ -736,7 +737,7 @@ async def get_contact_entity(request: Request, contact_id: str) -> dict[str, Any
         {"claim_type_key": c.claim_type_key, "object_id": c.object_id, "value": c.value}
         for c in claims
     ]
-    rendered = render_entity(entity.entity_type, entity.display_name, claim_dicts, entity_id=entity.entity_id)
+    rendered = await render_entity(entity.entity_type, entity.display_name, claim_dicts, entity_id=entity.entity_id, db=db)
 
     return {
         "entity_id": entity.entity_id,
@@ -909,12 +910,12 @@ async def read_workspace_file(request: Request, path: str = "") -> Any:
     size = resolved.stat().st_size
     suffix = resolved.suffix.lower()
 
-    # Images: stream directly via FileResponse
-    if suffix in _IMAGE_EXTENSIONS:
+    # Images/PDFs: stream directly via FileResponse
+    if suffix in _STREAMABLE_EXTENSIONS:
         mime_map = {
             ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
             ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
-            ".bmp": "image/bmp", ".ico": "image/x-icon",
+            ".bmp": "image/bmp", ".ico": "image/x-icon", ".pdf": "application/pdf",
         }
         content_type = mime_map.get(suffix, "application/octet-stream")
         return FileResponse(resolved, media_type=content_type)
@@ -1333,7 +1334,7 @@ async def get_memory_entity_detail(request: Request, entity_id: str) -> dict[str
         {"claim_type_key": c.claim_type_key, "object_id": c.object_id, "value": c.value}
         for c in claims
     ]
-    rendered = render_entity(entity.entity_type, entity.display_name, claim_dicts, entity_id=entity.entity_id)
+    rendered = await render_entity(entity.entity_type, entity.display_name, claim_dicts, entity_id=entity.entity_id, db=db)
 
     return {
         "entity_id": entity.entity_id,

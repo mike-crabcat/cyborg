@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -484,14 +485,16 @@ class LLMDispatchService(BaseService):
             )
             return result
 
-        except Exception as exc:
+        except BaseException as exc:
             elapsed = time.monotonic() - t0
-            logger.error("LLM dispatch tools failed: model=%s error=%s", resolved_model, exc)
+            is_cancel = isinstance(exc, asyncio.CancelledError)
+            if not is_cancel:
+                logger.error("LLM dispatch tools failed: model=%s error=%s", resolved_model, exc)
             await _record_log(self.db, log_id=log_id,
                 latency_seconds=elapsed,
                 messages_json=json.dumps(_sanitize_for_json(messages)),
                 status="failed",
-                error_message=str(exc),
+                error_message=f"Cancelled — server restart" if is_cancel else str(exc),
             )
             await self._publish_call(
                 status="failed", session_key=session_key,
@@ -586,14 +589,17 @@ class LLMDispatchService(BaseService):
                 ttft_seconds=ttft,
             )
 
-        except Exception as exc:
+        except BaseException as exc:
+            is_cancel = isinstance(exc, asyncio.CancelledError)
+            if not is_cancel:
+                logger.error("LLM dispatch stream+tools failed: model=%s error=%s", resolved_model, exc)
             await _record_log(self.db, log_id=log_id,
                 response_text=accumulated,
                 latency_seconds=time.monotonic() - t0,
                 ttft_seconds=ttft,
                 messages_json=json.dumps(_sanitize_for_json(messages)),
                 status="failed",
-                error_message=str(exc),
+                error_message=f"Cancelled — server restart" if is_cancel else str(exc),
             )
             await self._publish_call(
                 status="failed", session_key=session_key,

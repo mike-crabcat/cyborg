@@ -61,6 +61,8 @@ def make_routine_tools(
     @tool
     async def write_routine(routine_yaml: str) -> str:
         """Create or update a routine for this session. Accepts YAML with fields: name, schedule (cron), prompt, enabled.
+        The prompt must contain ONLY the action to perform — never include schedule/timing language
+        (e.g. "At 9am each day", "Every Monday"). The schedule is handled by the separate schedule field.
         Example:
           name: morning-digest
           schedule: "0 8 * * 1-5"

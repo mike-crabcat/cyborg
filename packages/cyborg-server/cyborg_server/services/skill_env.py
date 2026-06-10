@@ -18,11 +18,16 @@ ENV_MAPPINGS: dict[str, str] = {
 }
 
 
-def build_skill_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+def build_skill_env(
+    base_env: dict[str, str] | None = None,
+    *,
+    workspace_dir: str | None = None,
+) -> dict[str, str]:
     """Build the environment dict for a skill subprocess.
 
     Starts from the parent process environment (or base_env if provided),
     then adds standard-name aliases for any configured CYBORG_ secrets.
+    Also injects CYBORG_WORKSPACE_DIR when workspace_dir is provided.
     Only injects a mapping if the CYBORG_ var is set and non-empty.
     """
     env = dict(base_env or os.environ)
@@ -30,4 +35,6 @@ def build_skill_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
         value = env.get(cyborg_key, "")
         if value:
             env[standard_key] = value
+    if workspace_dir:
+        env["CYBORG_WORKSPACE_DIR"] = workspace_dir
     return env

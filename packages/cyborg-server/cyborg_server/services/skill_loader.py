@@ -93,7 +93,7 @@ def load_skill(workspace_dir: Path, skill_name: str) -> str:
     if not md.is_file():
         return f"Error: skill '{skill_name}' not found"
     content = md.read_text(encoding="utf-8").strip()
-    return f"Skill: {skill_name}\nPath: skills/{skill_name}/\n\n{content}"
+    return f"Skill: {skill_name}\nPath: {skill_dir.resolve()}/\n\n{content}"
 
 
 def load_skills_prompt(workspace_dir: Path) -> str:

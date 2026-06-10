@@ -91,7 +91,7 @@ def make_memory_tools(ctx: AppContext, *, session_key: str) -> list[Tool]:
             {"claim_type_key": c.claim_type_key, "object_id": c.object_id, "value": c.value}
             for c in claims
         ]
-        rendered = render_entity(entity.entity_type, entity.display_name, claim_dicts, entity_id=entity.entity_id)
+        rendered = await render_entity(entity.entity_type, entity.display_name, claim_dicts, entity_id=entity.entity_id, db=ctx.db)
         return json.dumps({
             "entity_id": entity.entity_id,
             "entity_type": entity.entity_type,

@@ -2,6 +2,58 @@
 
 All notable changes to Cyborg are documented here. Entries are based on analysis of actual code changes, not just commit messages.
 
+## 2026-06-09
+
+### Added
+- Add tool-based reconciliation loop replacing the previous JSON-operations approach: the LLM now has `get_entity`, `list_entities`, `add_claim`, `retract_claim`, `supersede_claim`, `create_entity`, `delete_entity`, and `merge_entities` tools to inspect and fix entities directly
+- Add orphan connection linking rules to reconciliation: connections without a parent trip are automatically discovered and linked by the LLM using entity read tools
+- Add `gpt-5.5` pricing to the dashboard cost tracker
+
+### Changed
+- Switch reconciliation from `memory_model` (small model) to the default bigger model for more capable autonomous entity repair
+- Change connection entity extraction from one-entity-per-booking to one-entity-per-hop: multi-leg journeys under a single PNR are now separate connection entities with shared `booking_ref`
+- Add reconciliation rule for stays to enforce exactly one arrival and one departure date, retracting duplicates
+
+### Removed
+- Remove inline `_apply_operations()` reconciliation dispatcher, replaced by tool-based LLM loop
+
+## 2026-06-08
+
+### Added
+- Add routines system: cron-scheduled prompts injected into sessions via `read_routine`/`write_routine`/`delete_routine` agent tools, with a `RoutineSchedulerTask` heartbeat task that fires due routines independently without blocking session activity
+- Add entity merge system for detecting and merging duplicate entities using embedding cosine similarity and LLM confirmation, with a CLI command (`cyborg memory merge --dry-run`), a dashboard API endpoint, and an inline merge UI in the memory dashboard
+- Add centralized entity type registry (`ENTITY_TYPE_REGISTRY` in `claim_types.py`) consolidating per-type metadata (prefixes, descriptions, keywords, extraction rules, reconciliation rules, display behavior)
+- Add `connection` as a first-class entity type replacing the old `transport` type, with structured claim types for departure/arrival locations, times, transport type, duration, booking ref, route, passengers, and seat
+- Add `stay` entity type replacing `tripstop`, with renamed claim keys (`accommodation`, `arrival_date`, `departure_date`, `accommodation_type`, `accommodation_address`)
+- Add new claim types: `preference` (person), `interest`/`opening_hours` (location), `attraction` (trip), `booking_ref`/`route`/`passenger`/`seat` (connection)
+- Add `find_session` and `search_bulletins` agent tools for discovering sessions by name and searching memory bulletins by time horizon with trust-scoped access control
+- Add `list_attachments` and `download_attachment` email tools for browsing and saving email attachments, with attachment metadata persisted to the database for all messages
+- Add Jinja2-based entity template engine for rich entity rendering with recursive entity reference resolution
+- Add entity deprecation status (`active`/`archived`/`deprecated`) and automatic deprecation of file entities with no valid `file_path` claim
+- Add `cyborg memory reindex` CLI command for rebuilding the FTS search index without LLM calls
+- Add PDF file viewer in the workspace dashboard using an embedded iframe
+- Add `deprecated` entity status to the database schema and migrations (schemas 325–328)
+
+### Changed
+- Convert entity rendering to async across all call sites to support recursive entity reference resolution via database lookups
+- Improve supplement prompt to prevent cross-entity claim extraction: claims must be about the target entity, not about other entities mentioned in the bulletins
+- Persist source bulletin IDs on supplement-generated claims instead of leaving them empty
+- Skip all entity-ref claims during supplement to prevent inferred relationships
+- Remove self-referential claims created during entity merges
+- Change entity ID display in memory dashboard from CSS-truncated to word-wrapped full IDs
+- Switch datetime handling in routines and cron to use local timezone instead of UTC
+- Handle `CancelledError` gracefully in LLM dispatch: catch `BaseException` and log cancellations as "server restart" instead of generic errors
+- Store attachment metadata for all email messages on receipt, then auto-download for trusted senders
+- Merge actual email reply body text into assistant session messages (matching WhatsApp behavior)
+- Move email attachment downloads from `projects_base_dir` to `data_dir`
+
+### Fixed
+- Fix supplement producing text-value connection claims instead of entity references by skipping all entity-ref claim types during supplement extraction
+- Fix embedding upsert to use DELETE+INSERT instead of INSERT OR REPLACE to handle stale data in sqlite-vec
+
+### Removed
+- Remove orphan transport discovery (`_find_orphan_transports`) from reconciliation, replaced by per-connection orphan linking rules
+
 ## 2026-06-07
 
 ### Added

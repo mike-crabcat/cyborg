@@ -29,6 +29,18 @@ async def load_workspace_prompt(workspace_dir: Path, db: Any = None) -> str:
         path = workspace_dir / name
         mtimes[name] = path.stat().st_mtime if path.is_file() else 0.0
 
+    # Include skill file mtimes so new/changed skills invalidate the cache
+    skills_dir = workspace_dir / "skills"
+    if skills_dir.is_dir():
+        for skill_path in sorted(skills_dir.iterdir()):
+            if not skill_path.is_dir():
+                continue
+            md = skill_path / "skill.md"
+            if not md.is_file():
+                md = skill_path / "SKILL.md"
+            if md.is_file():
+                mtimes[f"skills/{skill_path.name}"] = md.stat().st_mtime
+
     mtime_hash = tuple(mtimes.items())
     if _cached_prompt is not None and _cached_prompt[0] == mtime_hash:
         return _cached_prompt[1]
@@ -85,6 +97,14 @@ async def load_workspace_prompt(workspace_dir: Path, db: Any = None) -> str:
         "- If you did not call a tool, the action did not happen — do not claim it did.\n"
         "- If a tool returns an error, report the error honestly — do not pretend it succeeded.\n"
         "- If you are unsure whether you can do something, say so. Do not claim capabilities you have not verified.\n"
+    )
+
+    workspace_resolved = workspace_dir.expanduser().resolve()
+    parts.append(
+        "## Workspace\n"
+        f"Your workspace root is: {workspace_resolved}\n"
+        "File tool paths can be absolute (within this directory) or relative to workspace root.\n"
+        "All file operations are restricted to this directory."
     )
 
     combined = "\n\n".join(parts)

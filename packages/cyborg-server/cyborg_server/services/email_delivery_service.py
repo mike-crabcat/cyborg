@@ -101,6 +101,7 @@ class EmailDeliveryService(BaseService):
                 text=text,
                 html=html,
                 thread_id=thread_id,
+                attachments=attachments,
             )
 
         await self._persist_sent_message(

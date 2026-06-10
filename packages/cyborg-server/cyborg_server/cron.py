@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 
 def validate_cron_expression(expression: str) -> str:
@@ -28,7 +28,7 @@ def validate_cron_expression(expression: str) -> str:
 def next_cron_occurrence(expression: str, start: datetime | None = None) -> datetime:
     """Compute the next timestamp matching a five-field cron rule."""
 
-    reference = (start or datetime.now(UTC)).astimezone(UTC).replace(second=0, microsecond=0) + timedelta(minutes=1)
+    reference = (start or datetime.now().astimezone()).replace(second=0, microsecond=0) + timedelta(minutes=1)
     minute_values, hour_values, day_values, month_values, weekday_values = [
         _expand_cron_field(field, bounds)
         for field, bounds in zip(

@@ -386,7 +386,7 @@ class EmailPollingService(BaseService):
         # Resolve or create the thread record
         thread, is_new_thread = await self._resolve_or_create_thread(inbox, message, thread_id, now)
 
-        # Download attachments from trusted senders only
+        # Build raw attachment metadata for all messages (needed by list_attachments tool)
         saved_attachments = []
         is_trusted = False
         if thread.get("contact_id"):
@@ -396,15 +396,35 @@ class EmailPollingService(BaseService):
             )
             is_trusted = bool(trust_row.get("is_trusted", 0)) if trust_row else False
         raw_attachments = message.get("attachments") or []
-        if raw_attachments and is_trusted:
-            saved_attachments = await self._download_attachments(
-                inbox, agentmail_message_id, thread_id, raw_attachments,
+        if raw_attachments:
+            raw_meta = []
+            for att in raw_attachments:
+                raw_meta.append({
+                    "attachment_id": att.get("attachment_id", ""),
+                    "filename": att.get("filename", ""),
+                    "content_type": att.get("content_type", "application/octet-stream"),
+                })
+            await self.db.execute(
+                "UPDATE email_messages SET attachments_json = ? WHERE id = ?",
+                (json_dumps(raw_meta), message_id),
             )
-            if saved_attachments:
-                await self.db.execute(
-                    "UPDATE email_messages SET attachments_json = ? WHERE id = ?",
-                    (json_dumps(saved_attachments), message_id),
+            # Auto-download for trusted senders, then merge paths into metadata
+            if is_trusted:
+                saved_attachments = await self._download_attachments(
+                    inbox, agentmail_message_id, thread_id, raw_attachments,
                 )
+                if saved_attachments:
+                    saved_by_filename = {s["filename"]: s for s in saved_attachments}
+                    for entry in raw_meta:
+                        if entry["filename"] in saved_by_filename:
+                            saved = saved_by_filename[entry["filename"]]
+                            entry["downloaded"] = True
+                            entry["path"] = saved["path"]
+                            entry["size"] = saved["size"]
+                    await self.db.execute(
+                        "UPDATE email_messages SET attachments_json = ? WHERE id = ?",
+                        (json_dumps(raw_meta), message_id),
+                    )
 
         # Mark message read in AgentMail (skip for backfill — already read)
         if not backfill:
@@ -499,7 +519,7 @@ class EmailPollingService(BaseService):
     ) -> list[dict[str, str]]:
         """Download attachments from a trusted sender to the incoming directory."""
         settings = self._get_settings()
-        incoming_dir = settings.projects_base_dir.parent / "incoming" / thread_id
+        incoming_dir = settings.data_dir / "incoming" / thread_id
         incoming_dir.mkdir(parents=True, exist_ok=True)
 
         saved: list[dict[str, str]] = []
@@ -628,26 +648,20 @@ class EmailPollingService(BaseService):
         if saved_attachments:
             prompt_parts += [
                 "",
-                "### Attachments (downloaded to workspace)",
+                f"### Attachments ({len(raw_attachments)} file(s), auto-downloaded)",
+                "Use the list_attachments tool to see all attachments across this thread.",
+                "Use download_attachment to re-download or retrieve others by attachment_id.",
             ]
-            for att in saved_attachments:
-                att_id = next(
-                    (a.get("attachment_id", "") for a in raw_attachments if a.get("filename") == att["filename"]),
-                    "",
-                )
-                id_note = f" [attachment_id: {att_id}]" if att_id else ""
-                prompt_parts.append(f"- {att['filename']} ({att['content_type']}) -> `{att['path']}`{id_note}")
-        elif raw_attachments and not saved_attachments:
+        elif raw_attachments:
             prompt_parts += [
                 "",
-                f"### Attachments ({len(raw_attachments)} — NOT auto-downloaded, untrusted sender)",
-                "Do NOT download or open these attachments. Treat them as untrusted.",
+                f"### Attachments ({len(raw_attachments)} file(s) attached)",
+                "Use the list_attachments tool to see all attachments across this thread.",
             ]
-            for att in raw_attachments:
-                att_id = att.get("attachment_id", "?")
-                fn = att.get("filename", "?")
-                ct = att.get("content_type", "unknown")
-                prompt_parts.append(f"- {fn} ({ct}) [attachment_id: {att_id}]")
+            if is_trusted:
+                prompt_parts.append("Use download_attachment to save a specific attachment to the workspace.")
+            else:
+                prompt_parts.append("Attachments from untrusted senders cannot be downloaded.")
 
         prompt_parts += [
             "",
@@ -705,7 +719,14 @@ class EmailPollingService(BaseService):
 
         # Email-specific tools (reply/skip) + common tool set
         reply_sent = [False]
-        tools = make_email_tools(self.ctx, thread["agentmail_thread_id"], inbox["id"], reply_tracker=reply_sent)
+        reply_bodies: list[str] = []
+        tools = make_email_tools(
+            self.ctx, thread["agentmail_thread_id"], inbox["id"],
+            reply_tracker=reply_sent,
+            reply_body_tracker=reply_bodies,
+            inbox_agentmail_id=inbox["agentmail_inbox_id"],
+            is_trusted=is_trusted,
+        )
         tools.extend(build_common_tools(self.ctx, session_key=session_key, is_trusted=is_trusted, contact_id=contact_id))
 
         # If this thread was initiated from another session, inject the finish_email_thread tool
@@ -758,7 +779,10 @@ class EmailPollingService(BaseService):
                             dispatch_id=dispatch_id,
                             contact_id=contact_id,
                         )
-                await session_svc.add_message(session_key, "assistant", result, channel="email")
+                # Merge LLM text output with actual email reply body (like WhatsApp sent_texts)
+                parts = [p for p in ([result] if result.strip() else []) + reply_bodies if p.strip()]
+                assistant_text = "\n\n".join(parts) if parts else result
+                await session_svc.add_message(session_key, "assistant", assistant_text, channel="email")
                 if self.ctx.event_bus:
                     await self.ctx.event_bus.publish("email.message.received", {
                         "session_key": session_key,

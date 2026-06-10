@@ -36,12 +36,17 @@ function fileIcon(name: string): string {
   if (name.endsWith(".js")) return "js";
   if (name.endsWith(".sql")) return "db";
   if (/\.(png|jpg|jpeg|gif|webp|svg|bmp)$/i.test(name)) return "img";
+  if (name.endsWith(".pdf")) return "pdf";
   if (name.endsWith(".txt")) return "txt";
   return "~";
 }
 
 function isImageFile(name: string): boolean {
   return /\.(png|jpg|jpeg|gif|webp|svg|bmp|ico)$/i.test(name);
+}
+
+function isPdfFile(name: string): boolean {
+  return /\.pdf$/i.test(name);
 }
 
 function WorkspacePage() {
@@ -59,7 +64,7 @@ function WorkspacePage() {
   const { data: fileData, isLoading: fileLoading } = useQuery<FileResult>({
     queryKey: ["workspace-file", selectedFile],
     queryFn: () => fetchAPI<FileResult>(`/workspace/file?path=${encodeURIComponent(selectedFile!)}`),
-    enabled: selectedFile !== null && !isImageFile(selectedFile),
+    enabled: selectedFile !== null && !isImageFile(selectedFile) && !isPdfFile(selectedFile),
   });
 
   const saveMutation = useMutation({
@@ -108,6 +113,7 @@ function WorkspacePage() {
   const sorted = [...dirs, ...files];
 
   const selectedIsImage = selectedFile ? isImageFile(selectedFile) : false;
+  const selectedIsPdf = selectedFile ? isPdfFile(selectedFile) : false;
 
   return (
     <div className="flex flex-col h-full">
@@ -179,6 +185,18 @@ function WorkspacePage() {
                 src={`/dashboard/api/workspace/file?path=${encodeURIComponent(selectedFile)}`}
                 alt={selectedFile}
                 className="max-w-full object-contain"
+              />
+            </div>
+          ) : selectedIsPdf ? (
+            <div className="flex-1 min-h-0 flex flex-col">
+              <div className="flex items-center gap-2 px-3 py-1.5 border-b border-border shrink-0">
+                <span className="text-xs text-muted">{selectedFile.split("/").pop()}</span>
+                <button onClick={copyPath} className="text-[10px] text-accent hover:underline">copy path</button>
+              </div>
+              <iframe
+                src={`/dashboard/api/workspace/file?path=${encodeURIComponent(selectedFile)}`}
+                className="flex-1 w-full min-h-0 border-0"
+                title={selectedFile}
               />
             </div>
           ) : fileLoading ? (

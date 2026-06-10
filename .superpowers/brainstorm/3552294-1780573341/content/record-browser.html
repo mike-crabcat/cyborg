@@ -1,0 +1,26 @@
+<h2>Memory Pipeline Browser</h2>
+<p class="subtitle">Which browsing pattern fits how you'd debug extraction issues?</p>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Tabbed Record Types</h3>
+      <p>Top tabs: Bulletins | Claims | Entities | Relations. Each tab shows a filterable list. Click a record to see its detail panel. Cross-link between tabs (e.g. a claim links to its source bulletin and target entity).</p>
+    </div>
+  </div>
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Pipeline Trace View</h3>
+      <p>Start from a bulletin, see its extracted claims, then the resulting entity changes — a vertical trace. Good for "did this specific conversation produce good memory?" but harder to browse broadly.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Both — Tabs for Browsing, Trace for Debugging</h3>
+      <p>Tabbed record browser as the main view, with a "trace" button on any bulletin/claim that opens the chain view. More to build but covers both exploratory browsing and focused debugging.</p>
+    </div>
+  </div>
+</div>

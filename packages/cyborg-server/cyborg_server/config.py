@@ -193,6 +193,7 @@ class HarnessSettings:
     skill_dev_model: str = "sonnet"
     skill_dev_max_budget_usd: float = 5.0
     skill_dev_timeout_seconds: float = 300.0
+    local_subagent_model: str = "gpt-5.5"
 
 
 @dataclass(slots=True)
@@ -375,6 +376,7 @@ class Settings:
             skill_dev_model=os.getenv("CYBORG_HARNESS_SKILL_DEV_MODEL", "sonnet"),
             skill_dev_max_budget_usd=float(os.getenv("CYBORG_HARNESS_SKILL_DEV_MAX_BUDGET_USD", "5.0")),
             skill_dev_timeout_seconds=float(os.getenv("CYBORG_HARNESS_SKILL_DEV_TIMEOUT_SECONDS", "300")),
+            local_subagent_model=os.getenv("CYBORG_HARNESS_LOCAL_SUBAGENT_MODEL", "gpt-5.5"),
         )
 
         whatsapp_bridge = WhatsAppBridgeSettings(

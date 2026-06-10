@@ -59,10 +59,12 @@ how to use it.
 ### helper.py format
 
 The script should:
-- Accept command-line arguments via `sys.argv` (or argparse for complex skills)
+- Accept file paths as command-line arguments (absolute paths provided by Cyborg)
+- Use argparse or sys.argv for arguments
 - Print results to stdout (Cyborg captures this as the tool result)
 - Exit 0 on success, non-zero on failure (stderr is captured on error)
 - Be self-contained — avoid assuming a specific working directory
+- Do NOT resolve paths internally — use the paths passed as arguments directly
 
 ### pyproject.toml (optional)
 
@@ -91,9 +93,11 @@ When helper.py runs via run_script, these standard environment variables are ava
 - `OPENAI_API_KEY`: OpenAI API key (if configured). Use with `OpenAI()` directly.
 - `OPENAI_BASE_URL`: Custom OpenAI API base URL (if configured).
 - `AGENTMAIL_API_KEY`: AgentMail API key (if configured).
+- `CYBORG_WORKSPACE_DIR`: Absolute path to the workspace root directory. \
+  Useful as a fallback, but prefer receiving paths as command-line arguments.
 
 Skills should use `os.environ.get("VAR_NAME")` or rely on SDK auto-detection. \
-Do NOT reference CYBORG_-prefixed variable names.
+Do NOT reference CYBORG_-prefixed variable names OTHER THAN `CYBORG_WORKSPACE_DIR`.
 
 ## Workflow
 

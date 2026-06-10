@@ -141,7 +141,7 @@ async def _render_entity_claims(db: Any, entity_id: str) -> str:
         {"claim_type_key": r["claim_type_key"], "object_id": r["object_id"], "value": r["value"]}
         for r in claims
     ]
-    return render_entity(entity_row["entity_type"], entity_row["display_name"], claim_dicts, entity_id=entity_id)
+    return await render_entity(entity_row["entity_type"], entity_row["display_name"], claim_dicts, entity_id=entity_id, db=db)
 
 
 async def _compute_overlap(db: Any, id_a: str, id_b: str) -> str:

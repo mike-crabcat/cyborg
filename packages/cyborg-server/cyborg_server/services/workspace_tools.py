@@ -27,14 +27,24 @@ _SCRIPT_TIMEOUT_SECONDS = 900
 
 
 def _resolve_path(ctx: AppContext, path: str) -> Path:
-    """Resolve a relative path against the workspace dir, preventing traversal."""
+    """Resolve a path against the workspace dir.
+
+    Accepts both absolute and workspace-relative paths:
+    - Absolute path: must be within the workspace, returned as-is after validation.
+    - Relative path: resolved against workspace root (backward compatible).
+    """
     workspace = ctx.settings.harness.workspace_dir.expanduser().resolve()
-    resolved = (workspace / path)
-    # Block traversal attacks (e.g. "../../etc/passwd") without resolving symlinks,
-    # so that symlinked directories inside the workspace remain accessible.
-    if ".." in Path(path).parts:
+    parsed = Path(path)
+    if ".." in parsed.parts:
         raise ValueError(f"Path '{path}' escapes workspace directory")
-    return resolved
+    if parsed.is_absolute():
+        resolved = parsed.resolve()
+        try:
+            resolved.relative_to(workspace)
+        except ValueError:
+            raise ValueError(f"Path '{path}' is outside the workspace directory")
+        return resolved
+    return workspace / path
 
 
 def make_workspace_tools(ctx: AppContext, *, session_key: str | None = None):
@@ -47,7 +57,7 @@ def make_workspace_tools(ctx: AppContext, *, session_key: str | None = None):
     async def ls(
         path: str = "",
     ) -> str:
-        """List files and directories in a single workspace directory (non-recursive). Path is relative to the workspace root ('/')."""
+        """List files and directories in a single workspace directory (non-recursive). Path can be absolute (within workspace) or relative to workspace root."""
         workspace = ctx.settings.harness.workspace_dir.expanduser().resolve()
         target = _resolve_path(ctx, path) if path else workspace
         if not target.is_dir():
@@ -80,7 +90,7 @@ def make_workspace_tools(ctx: AppContext, *, session_key: str | None = None):
     async def read_file(
         path: str,
     ) -> str:
-        """Read the contents of a file in the workspace. Path is relative to the workspace root ('/')."""
+        """Read the contents of a file in the workspace. Path can be absolute (within workspace) or relative to workspace root."""
         resolved = _resolve_path(ctx, path)
         if not resolved.is_file():
             return f"Error: '{path}' is not a file"
@@ -105,7 +115,7 @@ def make_workspace_tools(ctx: AppContext, *, session_key: str | None = None):
     async def read_image(
         path: str,
     ) -> ImageInjection:
-        """Load an image from the workspace so you can see and analyze it. Supports PNG, JPG, GIF, WebP, and BMP. Path is relative to the workspace root ('/')."""
+        """Load an image from the workspace so you can see and analyze it. Supports PNG, JPG, GIF, WebP, and BMP. Path can be absolute (within workspace) or relative to workspace root."""
         resolved = _resolve_path(ctx, path)
         if not resolved.is_file():
             return ImageInjection(text=f"Error: '{path}' is not a file", data_url="")
@@ -131,7 +141,7 @@ def make_workspace_tools(ctx: AppContext, *, session_key: str | None = None):
         path: str,
         content: str,
     ) -> str:
-        """Write content to a file in the workspace. Path is relative to the workspace root ('/'). Creates parent directories if needed."""
+        """Write content to a file in the workspace. Path can be absolute (within workspace) or relative to workspace root. Creates parent directories if needed."""
         if len(content.encode("utf-8")) > _MAX_WRITE_BYTES:
             return f"Error: content exceeds {_MAX_WRITE_BYTES} bytes"
 
@@ -154,7 +164,7 @@ def make_workspace_tools(ctx: AppContext, *, session_key: str | None = None):
         path: str,
         recursive: bool = False,
     ) -> str:
-        """Delete a file or directory in the workspace. Path is relative to the workspace root ('/'). Set recursive=true to delete non-empty directories."""
+        """Delete a file or directory in the workspace. Path can be absolute (within workspace) or relative to workspace root. Set recursive=true to delete non-empty directories."""
         workspace = ctx.settings.harness.workspace_dir.expanduser().resolve()
         resolved = _resolve_path(ctx, path)
         if resolved == workspace:
@@ -178,8 +188,8 @@ def make_workspace_tools(ctx: AppContext, *, session_key: str | None = None):
         source: str,
         destination: str,
     ) -> str:
-        """Move or rename a file or directory in the workspace. Paths are relative to the workspace root ('/'). Creates destination parent directories if needed."""
-        src = _resolve_path(ctx, source)
+        """Move or rename a file or directory into the workspace. Source can be any accessible path (e.g. incoming attachments). Destination must be within the workspace. Creates destination parent directories if needed."""
+        src = Path(source).resolve()
         dst = _resolve_path(ctx, destination)
         if not src.exists():
             return f"Error: '{source}' does not exist"
@@ -188,6 +198,26 @@ def make_workspace_tools(ctx: AppContext, *, session_key: str | None = None):
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(src), str(dst))
         logger.info("Workspace move: %s -> %s", source, destination)
+        return json.dumps({"ok": True, "from": source, "to": destination})
+
+    @tool
+    async def cp(
+        source: str,
+        destination: str,
+    ) -> str:
+        """Copy a file or directory into the workspace. Source can be any accessible path (e.g. incoming attachments). Destination must be within the workspace. Creates destination parent directories if needed."""
+        src = Path(source).resolve()
+        dst = _resolve_path(ctx, destination)
+        if not src.exists():
+            return f"Error: '{source}' does not exist"
+        if dst.exists():
+            return f"Error: '{destination}' already exists"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            shutil.copytree(str(src), str(dst))
+        else:
+            shutil.copy2(str(src), str(dst))
+        logger.info("Workspace copy: %s -> %s", source, destination)
         return json.dumps({"ok": True, "from": source, "to": destination})
 
     @tool
@@ -260,7 +290,7 @@ def make_workspace_tools(ctx: AppContext, *, session_key: str | None = None):
         path: str,
         args: list[str] = [],
     ) -> str:
-        """Run a Python script in the workspace. Path is relative to the workspace root.
+        """Run a Python script in the workspace. Path can be absolute (within workspace) or relative to workspace root.
         The script runs via `uv run` from its parent directory (so per-script pyproject.toml works).
         Returns the script's stdout. Args are passed as command-line arguments."""
         resolved = _resolve_path(ctx, path)
@@ -282,7 +312,9 @@ def make_workspace_tools(ctx: AppContext, *, session_key: str | None = None):
                 cwd=str(resolved.parent),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=build_skill_env(),
+                env=build_skill_env(
+                    workspace_dir=str(ctx.settings.harness.workspace_dir.expanduser().resolve()),
+                ),
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(),
@@ -305,11 +337,11 @@ def make_workspace_tools(ctx: AppContext, *, session_key: str | None = None):
         skill_name: str,
     ) -> str:
         """Load the full instructions for a skill by name. Returns the skill's instructions
-        and the workspace-relative path to its directory so you can call run_script with correct paths."""
+        and the path to its directory so you can call run_script with correct paths."""
         from cyborg_server.services.skill_loader import load_skill
         return load_skill(ctx.settings.harness.workspace_dir, skill_name)
 
-    tools = [ls, read_file, read_image, write_file, rm, mv, find, run_script, use_skill]
+    tools = [ls, read_file, read_image, write_file, rm, mv, cp, find, run_script, use_skill]
 
     if session_key:
         @tool

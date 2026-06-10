@@ -20,6 +20,12 @@ emoji reactions, casual chatter.
 5. Produce 0 to N bulletins. If nothing is worth remembering, return [].
 6. Use conservative wording: a suggestion is not a decision, a mention is not \
 a task, a possible plan is not a confirmed booking.
+7. Messages from the assistant (the AI agent) often reiterate, recall, or \
+summarize information already in memory. Do NOT create bulletins for \
+information the assistant is simply repeating or recalling. Only create \
+bulletins from assistant messages when the human explicitly confirms, corrects, \
+or adds new details to what the assistant said (e.g. "yes, and the flight was \
+$450" or "no, it was actually March not April").
 
 ## Memory-worthy categories
 

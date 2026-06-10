@@ -26,16 +26,21 @@ for db in \
   fi
 done
 
-# Workspace config (harness settings, etc)
+# Workspace config and files
 if [ -d "$WORKSPACE_DIR" ]; then
   mkdir -p "$STAGE/.config/cyborg"
   cp -r "$WORKSPACE_DIR"/.env "$STAGE/.config/cyborg/" 2>/dev/null || true
-  for f in "$WORKSPACE_DIR"/settings*.json "$WORKSPACE_DIR"/harness/*.json; do
+  for f in "$WORKSPACE_DIR"/settings*.json; do
     [ -f "$f" ] || continue
     dest="$STAGE/$(echo "$f" | sed "s|^$HOME/||")"
     mkdir -p "$(dirname "$dest")"
     cp "$f" "$dest"
   done
+  # Full harness workspace (scripts, artifacts, generated-images, etc)
+  if [ -d "$WORKSPACE_DIR/harness" ]; then
+    rsync -a --exclude='*.log' "$WORKSPACE_DIR/harness/" "$STAGE/.config/cyborg/harness/" 2>/dev/null || \
+      cp -r "$WORKSPACE_DIR/harness" "$STAGE/.config/cyborg/"
+  fi
 fi
 
 # Data directory (non-code runtime data)

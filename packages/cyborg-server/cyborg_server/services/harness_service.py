@@ -46,7 +46,6 @@ class HarnessService(BaseService):
 
         async for chunk in dispatch.chat_stream(
             messages,
-            provider="openai",
             model=resolved_model,
             call_category="voice_chat",
             session_key=session_key,
@@ -86,7 +85,6 @@ class HarnessService(BaseService):
         dispatch = LLMDispatchService(self.ctx)
         return await dispatch.chat(
             messages,
-            provider="openai",
             model=resolved_model,
             call_category="voice_chat",
             session_key=session_key or None,

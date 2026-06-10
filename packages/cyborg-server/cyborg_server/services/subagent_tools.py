@@ -18,14 +18,17 @@ def make_subagent_tools(ctx: AppContext, session_key: str) -> list:
     """Create subagent management tools for a trusted session."""
 
     @tool
-    async def create_subagent(task: str) -> str:
+    async def create_subagent(task: str, agent_type: str = "claude", persona: bool = False, model: str = "") -> str:
         """Spawn a subagent to work on a task asynchronously. Returns subagent_id immediately.
+        agent_type: 'claude' (spawns Claude CLI subprocess) or 'local' (runs in-process, faster).
+        persona: if true and local, load full agent persona; if false, uses minimal system prompt.
+        model: override model for local subagents (default: gpt-5.5).
         After calling this, you MUST send a message to the user summarizing what you delegated.
         Use check_subagent to poll for results and message_subagent for follow-up."""
         from cyborg_server.services.subagent_service import SubagentService
 
         svc = SubagentService(ctx)
-        result = await svc.create_subagent(task, session_key)
+        result = await svc.create_subagent(task, session_key, agent_type=agent_type, persona=persona, model=model)
         return json.dumps(result)
 
     @tool

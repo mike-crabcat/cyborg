@@ -164,6 +164,7 @@ class MemoryService(BaseService):
                     result = await reconcile_entity(
                         self.db, llm, eid,
                         update_fts_fn=self._update_entity_fts,
+                        schedule_reconciliation_fn=self._schedule_reconciliation,
                     )
                     if result.get("operations_applied") or result.get("questions_raised"):
                         logger.info(
@@ -200,6 +201,7 @@ class MemoryService(BaseService):
             result = await reconcile_entity(
                 self.db, llm, eid,
                 update_fts_fn=self._update_entity_fts,
+                schedule_reconciliation_fn=self._schedule_reconciliation,
             )
             results.append(result)
 
@@ -569,11 +571,12 @@ class MemoryService(BaseService):
             for r in claims
         ]
 
-        rendered = render_entity(
+        rendered = await render_entity(
             entity_row["entity_type"],
             entity_row["display_name"],
             claim_dicts,
             entity_id=entity_id,
+            db=self.db,
         )
         await self.db.execute(
             "DELETE FROM memory_entities_fts WHERE entity_id = ?",
@@ -875,7 +878,7 @@ class MemoryService(BaseService):
                 {"claim_type_key": c["claim_type_key"], "object_id": c["object_id"], "value": c["value"]}
                 for c in claims
             ]
-            rendered_map[r["entity_id"]] = render_entity(r["entity_type"], r["display_name"], claim_dicts, entity_id=r["entity_id"])
+            rendered_map[r["entity_id"]] = await render_entity(r["entity_type"], r["display_name"], claim_dicts, entity_id=r["entity_id"], db=self.db)
 
         # Batch embed (up to 100 at a time)
         entity_ids = list(rendered_map.keys())
